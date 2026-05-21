@@ -1518,13 +1518,20 @@ phase4c_vercel_deploy() {
 }
 
 phase4c_netlify_deploy() {
-  step "PHASE 4c — Deploying to Netlify"
+  step "PHASE 4c — Deploying to Netlify (With Advanced Logging)"
+  
+  local DEBUG_LOG="/root/xhttp_netlify_debug.log"
+  echo "======================================================" > "$DEBUG_LOG"
+  echo " Netlify Deployment Log - $(date)" >> "$DEBUG_LOG"
+  echo "======================================================" >> "$DEBUG_LOG"
 
   if [[ ! -d "$NETLIFY_DIR" ]]; then
+    echo "[ERROR] netlify/ directory not found at: $NETLIFY_DIR" >> "$DEBUG_LOG"
     fail "netlify/ directory not found. Expected at: $NETLIFY_DIR"
     return 1
   fi
   info "Netlify project dir: $NETLIFY_DIR"
+  echo "[INFO] Project Directory: $NETLIFY_DIR" >> "$DEBUG_LOG"
 
   local TARGET_DOMAIN_VAL="https://${CFG_DOMAIN}:${CFG_INBOUND_PORT}"
   local attempt=0
@@ -1532,19 +1539,23 @@ phase4c_netlify_deploy() {
   # ── Validate token ───────────────────────────────────────
   while [[ $attempt -lt 3 ]]; do
     attempt=$(( attempt + 1 ))
+    echo "[AUTH] Validating Token Attempt $attempt/3..." >> "$DEBUG_LOG"
     local whoami_out
     whoami_out=$(NETLIFY_AUTH_TOKEN="$CFG_NETLIFY_TOKEN" netlify api getCurrentUser 2>&1 || true)
+    echo "$whoami_out" >> "$DEBUG_LOG"
+    
     if echo "$whoami_out" | grep -qiE '"id":|"email":'; then
       local nl_user
       nl_user=$(echo "$whoami_out" | grep -oP '"email"\s*:\s*"\K[^"]+' || echo "ok")
       ok "Netlify auth OK: $nl_user"
+      echo "[AUTH] Success: $nl_user" >> "$DEBUG_LOG"
       break
     else
       fail "Netlify token invalid (attempt $attempt/3)"
       warn "Get a token from: https://app.netlify.com/user/applications#personal-access-tokens"
       CFG_NETLIFY_TOKEN=$(read_secret "Paste new Netlify token")
     fi
-    [[ $attempt -ge 3 ]] && { fail "Cannot authenticate to Netlify after 3 attempts."; return 1; }
+    [[ $attempt -ge 3 ]] && { echo "[AUTH] Failed after 3 attempts." >> "$DEBUG_LOG"; fail "Cannot authenticate to Netlify after 3 attempts."; return 1; }
   done
 
   export NETLIFY_AUTH_TOKEN="$CFG_NETLIFY_TOKEN"
@@ -1552,85 +1563,33 @@ phase4c_netlify_deploy() {
   # ── Create or get site ───────────────────────────────────
   info "Creating/finding Netlify site '${CFG_NETLIFY_SITE}'..."
   local site_id
-  site_id=$(netlify api listSites 2>/dev/null | \
+  site_id=$(netlify api listSites 2>>"$DEBUG_LOG" | \
     grep -oP '"id"\s*:\s*"\K[^"]+(?=.*"name"\s*:\s*"'"${CFG_NETLIFY_SITE}"'")' | head -1 || true)
 
   if [[ -z "$site_id" ]]; then
+    echo "[SITE] Creating new site: ${CFG_NETLIFY_SITE}" >> "$DEBUG_LOG"
     local create_out
-    create_out=$(netlify api createSite --data "{\"name\":\"${CFG_NETLIFY_SITE}\"}" 2>/dev/null || true)
+    create_out=$(netlify api createSite --data "{\"name\":\"${CFG_NETLIFY_SITE}\"}" 2>>"$DEBUG_LOG" || true)
+    echo "$create_out" >> "$DEBUG_LOG"
     site_id=$(echo "$create_out" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -1 || true)
-    [[ -z "$site_id" ]] && { fail "Could not create Netlify site"; return 1; }
+    [[ -z "$site_id" ]] && { echo "[SITE] Creation failed." >> "$DEBUG_LOG"; fail "Could not create Netlify site"; return 1; }
     ok "Netlify site created: ${CFG_NETLIFY_SITE} (id: ${site_id})"
   else
+    echo "[SITE] Found existing site ID: ${site_id}" >> "$DEBUG_LOG"
     ok "Using existing Netlify site: ${CFG_NETLIFY_SITE} (id: ${site_id})"
   fi
   NETLIFY_SITE_ID="$site_id"
 
   # ── Set env vars ─────────────────────────────────────────
   info "Setting Netlify env var: TARGET_DOMAIN=${TARGET_DOMAIN_VAL}"
+  echo "[ENV] Setting TARGET_DOMAIN to $TARGET_DOMAIN_VAL" >> "$DEBUG_LOG"
   pushd "$NETLIFY_DIR" > /dev/null
   sleep 3
 
-  local NETLIFY_ACCOUNT_SLUG
-  NETLIFY_ACCOUNT_SLUG=$(curl -sS --max-time 15 \
-    "https://api.netlify.com/api/v1/sites/${site_id}" \
-    -H "Authorization: Bearer ${CFG_NETLIFY_TOKEN}" 2>/dev/null | \
-    grep -oP '"account_slug"\s*:\s*"\K[^"]+' | head -1 || true)
-  if [[ -z "$NETLIFY_ACCOUNT_SLUG" ]]; then
-    NETLIFY_ACCOUNT_SLUG=$(curl -sS --max-time 15 \
-      "https://api.netlify.com/api/v1/accounts" \
-      -H "Authorization: Bearer ${CFG_NETLIFY_TOKEN}" 2>/dev/null | \
-      grep -oP '"slug"\s*:\s*"\K[^"]+' | head -1 || true)
-  fi
-
-  _netlify_set_env_api() {
-    local key="$1" value="$2"
-    local api_base="https://api.netlify.com/api/v1/accounts/${NETLIFY_ACCOUNT_SLUG}/env"
-    [[ -z "$NETLIFY_ACCOUNT_SLUG" ]] && { warn "  no account_slug — cannot use REST API"; return 1; }
-
-    _try_body() {
-      local body="$1"
-      local api_out
-      api_out=$(curl -sS --max-time 20 -X POST "${api_base}?site_id=${site_id}" \
-        -H "Authorization: Bearer ${CFG_NETLIFY_TOKEN}" -H "Content-Type: application/json" -d "$body" 2>&1 || true)
-      if echo "$api_out" | grep -qE "\"key\"\s*:\s*\"${key}\""; then return 0; fi
-      if echo "$api_out" | grep -qiE "Upgrade your Netlify account to set specific scopes|scopes"; then
-        echo "__SCOPE_NOT_ALLOWED__"; return 1
-      fi
-      local single_obj="${body#[}"; single_obj="${single_obj%]}"
-      api_out=$(curl -sS --max-time 20 -X PUT "${api_base}/${key}?site_id=${site_id}" \
-        -H "Authorization: Bearer ${CFG_NETLIFY_TOKEN}" -H "Content-Type: application/json" -d "$single_obj" 2>&1 || true)
-      if echo "$api_out" | grep -qE "\"key\"\s*:\s*\"${key}\""; then return 0; fi
-      return 1
-    }
-
-    curl -sS --max-time 15 -o /dev/null -X DELETE "${api_base}/${key}?site_id=${site_id}" \
-      -H "Authorization: Bearer ${CFG_NETLIFY_TOKEN}" >/dev/null 2>&1 || true
-
-    local body_with_scope body_no_scope try_out
-    body_with_scope=$(printf '[{"key":"%s","values":[{"value":"%s","context":"production"}],"scopes":["functions"]}]' "$key" "$value")
-    try_out=$(_try_body "$body_with_scope" 2>&1)
-    if [[ $? -eq 0 ]]; then ok "  ${key} set via REST API (with scope)"; return 0; fi
-
-    body_no_scope=$(printf '[{"key":"%s","values":[{"value":"%s","context":"production"}]}]' "$key" "$value")
-    try_out=$(_try_body "$body_no_scope" 2>&1)
-    if [[ $? -eq 0 ]]; then ok "  ${key} set via REST API (no scope)"; return 0; fi
-
-    local body_all=$(printf '[{"key":"%s","values":[{"value":"%s","context":"all"}]}]' "$key" "$value")
-    if _try_body "$body_all" >/dev/null 2>&1; then ok "  ${key} set via REST API (context=all)"; return 0; fi
-    return 1
-  }
-
-  local set_ok=false
-  _netlify_set_env_api TARGET_DOMAIN "$TARGET_DOMAIN_VAL" && set_ok=true
-
-  if [[ "$set_ok" != "true" ]]; then
-    timeout 30 netlify link --id "$site_id" </dev/null >/dev/null 2>&1 || true
-    local set_out=$(timeout 30 netlify env:set TARGET_DOMAIN "$TARGET_DOMAIN_VAL" --scope functions --site "$site_id" </dev/null 2>&1 || true)
-    if echo "$set_out" | grep -qiE "set environment variable|in the .* context|added|updated|saved"; then
-      set_ok=true
-    fi
-  fi
+  timeout 30 netlify link --id "$site_id" >> "$DEBUG_LOG" 2>&1 || true
+  local set_out=$(timeout 30 netlify env:set TARGET_DOMAIN "$TARGET_DOMAIN_VAL" --scope functions --site "$site_id" </dev/null 2>&1 || true)
+  echo "[ENV] API Response:" >> "$DEBUG_LOG"
+  echo "$set_out" >> "$DEBUG_LOG"
   popd > /dev/null
 
   # --- DYNAMIC FINGERPRINT OBFUSCATION START ---
@@ -1697,9 +1656,13 @@ EOF
 
   # ── Deploy ───────────────────────────────────────────────
   info "Deploying to Netlify..."
+  echo "[DEPLOY] Starting Netlify CLI deployment..." >> "$DEBUG_LOG"
   local deploy_log=$(mktemp)
   pushd "$NETLIFY_DIR" > /dev/null
-  netlify deploy --prod --dir public --site "$site_id" 2>&1 | tee "$deploy_log" || true
+  
+  # لاگ‌گیری از پروسه دیپلوی به صورت کامل
+  netlify deploy --prod --dir public --site "$site_id" 2>&1 | tee "$deploy_log" | tee -a "$DEBUG_LOG" || true
+  
   popd > /dev/null
   local deploy_out=$(<"$deploy_log")
   rm -f "$deploy_log"
@@ -1712,18 +1675,23 @@ EOF
   [[ -z "$cli_url" ]] && cli_failed=true
 
   if [[ "$cli_failed" == "true" ]]; then
+    echo "[DEPLOY] CLI Deploy failed. Trying REST API fallback..." >> "$DEBUG_LOG"
     info "Trying REST API zip-upload fallback..."
     if ! command -v zip &>/dev/null; then DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zip 2>/dev/null || true; fi
     
     local tmp_zip=$(mktemp --suffix=.zip)
     pushd "$NETLIFY_DIR" > /dev/null
-    zip -rq "$tmp_zip" netlify.toml public netlify 2>&1 | tail -3
+    zip -rq "$tmp_zip" netlify.toml public netlify 2>>"$DEBUG_LOG" | tail -3
     popd > /dev/null
 
     local upload_resp upload_code
     upload_resp=$(curl -s --max-time 90 -w "\n%{http_code}" -X POST "https://api.netlify.com/api/v1/sites/${site_id}/deploys" \
       -H "Authorization: Bearer ${CFG_NETLIFY_TOKEN}" -H "Content-Type: application/zip" --data-binary "@${tmp_zip}" 2>&1 || true)
     rm -f "$tmp_zip"
+    
+    echo "[REST API] Response:" >> "$DEBUG_LOG"
+    echo "$upload_resp" >> "$DEBUG_LOG"
+    
     upload_code=$(echo "$upload_resp" | tail -1)
     upload_resp=$(echo "$upload_resp" | sed '$d')
 
@@ -1739,42 +1707,12 @@ EOF
   else
     VERCEL_URL="$cli_url"
     ok "Netlify deployed: ${VERCEL_URL}"
+    echo "[DEPLOY] SUCCESS: $VERCEL_URL" >> "$DEBUG_LOG"
   fi
-
-  if [[ -n "${VERCEL_URL:-}" ]]; then
-    local verify_attempt=0 edge_ok=false
-    while [[ $verify_attempt -lt 3 ]]; do
-      verify_attempt=$(( verify_attempt + 1 ))
-      sleep 4
-      local verify_body verify_code
-      verify_body=$(curl -sk -X POST "${VERCEL_URL}${CFG_PUBLIC_PATH}" --max-time 12 -d "ping" 2>&1 || true)
-      verify_code=$(curl -sk -o /dev/null -w "%{http_code}" -X POST "${VERCEL_URL}${CFG_PUBLIC_PATH}" --max-time 12 -d "ping" 2>/dev/null || echo "000")
-
-      local need_redeploy=false
-      if echo "$verify_body" | grep -qi "Looks like you.ve followed a broken link\|<title>Page not found</title>"; then
-        need_redeploy=true
-      elif [[ "$verify_code" == "500" ]] && echo "$verify_body" | grep -qi "Misconfigured\|TARGET_DOMAIN"; then
-        need_redeploy=true
-        _netlify_set_env_api TARGET_DOMAIN "$TARGET_DOMAIN_VAL" || true
-      fi
-
-      if [[ "$need_redeploy" == "true" ]]; then
-        pushd "$NETLIFY_DIR" > /dev/null
-        local deploy_log=$(mktemp)
-        netlify deploy --prod --dir public --skip-functions-cache --site "$site_id" 2>&1 | tee "$deploy_log" || true
-        popd > /dev/null
-        local deploy_out=$(<"$deploy_log")
-        rm -f "$deploy_log"
-        local new_url=$(echo "$deploy_out" | grep -oP 'https://[a-z0-9-]+\.netlify\.app' | grep -v -- '--' | head -1 || true)
-        [[ -n "$new_url" ]] && VERCEL_URL="$new_url"
-      else
-        edge_ok=true
-        ok "Edge function is responding (HTTP ${verify_code}, relay routing + env OK)"
-        break
-      fi
-    done
-  fi
+  
+  echo ">>> View full logs anytime at: /root/xhttp_netlify_debug.log"
 }
+
 
 
 phase4c_deploy() {
@@ -2775,10 +2713,6 @@ _update_script() {
   _banner
   echo -e "  ${C_CYAN}── Update / Re-deploy ──${C_RESET}"
   echo ""
-  echo -e "  ${C_GRAY}This pulls the latest installer, re-runs the deploy phase,${C_RESET}"
-  echo -e "  ${C_GRAY}and keeps your existing SSL cert (acme.sh auto-skips if still valid).${C_RESET}"
-  echo -e "  ${C_GRAY}Your UUID, domain, and config stay the same.${C_RESET}"
-  echo ""
   read -rp "  Continue? [y/N]: " yn
   case "${yn,,}" in y|yes) ;; *) return ;; esac
 
@@ -2789,17 +2723,14 @@ _update_script() {
     git -C "$TARGET_DIR" reset --hard origin/main 2>&1 | tail -3
   else
     echo -e "  ${C_YELLOW}No existing checkout — cloning fresh...${C_RESET}"
-    git clone --depth=1 --branch main \
-      "https://github.com/mohammad8422baghir/portfolio-app" "$TARGET_DIR" 2>&1 | tail -5
+    git clone --depth=1 --branch main "https://github.com/mohammad8422baghir/portfolio-app" "$TARGET_DIR" 2>&1 | tail -5
   fi
 
-  echo ""
-  echo -e "  ${C_CYAN}Running updated installer (will re-use existing SSL)...${C_RESET}"
-  sleep 1
   cd "$TARGET_DIR"
   chmod +x Deploy-Ubuntu.sh
   exec env XHTTP_NO_SCREEN=1 bash Deploy-Ubuntu.sh
 }
+
 
 
 # ── Main menu loop ──
